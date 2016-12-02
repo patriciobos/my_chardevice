@@ -1,0 +1,1 @@
+sudo ./reader /dev/my_chardevice

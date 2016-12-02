@@ -1,0 +1,7 @@
+sudo rmmod my_chardevice
+sudo dmesg -c
+sudo dmesg -c
+clear
+sudo insmod my_chardevice.ko
+dmesg
+

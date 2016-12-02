@@ -1,0 +1,1 @@
+sudo ./writer /dev/my_chardevice
