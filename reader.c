@@ -62,15 +62,14 @@ int main (int argc, char ** argv){
     nbytes = read(fd, data, BUF_SIZE);
     
     if(nbytes == -1) {
-    	perror("Could not read from my_chardevice :(\n");
+    	perror("ERROR: Could not read from my_chardevice :(\n");
     	break;
     }
     
     if (nbytes > 0) {
-      printf("Read: %s\n", data);
-      count -=nbytes;
+      printf("Read from kernel space: %s\n", data);
     }
-    /* */
+
     sleep(2);
   }
 

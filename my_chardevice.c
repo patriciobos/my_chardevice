@@ -50,19 +50,24 @@
 #define DRVCLASS "my_chardrv"
 #define DRVDEVICENAME "my_chardevice"
 
-#define CHAR_BUFFER_SIZE 32
+#define BUFFER_SIZE 32
+#define MAX_READERS 10
 
 /* Public global variable definitions*/
 
 struct cdev device_cdev;    //Kernel structure for char devices.
 
-spinlock_t lock_buffer;
-spinlock_t lock_buffer_aux;
+spinlock_t lock_buff_a;
+spinlock_t lock_buff_aux;
+spinlock_t lock_buff_b;
 
 struct semaphore sema_buff_a;
 struct semaphore sema_buff_aux;
+struct semaphore sema_buff_b;
 
-//mutex_t mutex_buff_a;
+
+
+
 
 /* --------------------------------- */
 
@@ -74,32 +79,66 @@ static struct class * char_classdev;
 static char * ptr_BUFF_A = NULL;
 static char * ptr_BUFF_AUX = NULL;
 static char * ptr_BUFF_B = NULL;
+
 static atomic_t users=ATOMIC_INIT(0);
+
+
+//TODO: check writeIndex data type.  there are some comparisons between loff_t and atomic_t?
+static loff_t writeIndex = 0;
+static loff_t globalReadIndex = 0;
+
+static unsigned int currentReaders;
 
 static struct timer_list timer_cpy_buffers;
 
-static loff_t write_index = 0;
+typedef struct readerControl
+{
+	u8 readerID;
+	loff_t readIndex; 
+	int readerLock;
+//	spinlock_t readerSpinlock;
+  mutex_t readerMutex;
+	char readerBuffer[BUFFER_SIZE];
+} readerControl_t;
 
-static int current_readers;
+readerControl_t readers[MAX_READERS];
 
 /* ----------------------------------- */
+
+void init_reader_struct(void)
+{
+	u8 i = 0;
+	
+	for(i=0; i<MAX_READERS; i++)
+	{	
+		readers[i].readerID = 0;
+		mb();
+		atomic_set(&readers[i].readIndex,0);
+		//readers[i].readIndex = 0;
+		//spin_lock_init(&readers[i].readerSpinlock);
+		mutex_init(&readers[i].readerMutex);
+		readers[i].readerLock = 0;
+		readers[i].readerBuffer[0] = 0;
+	}
+}
 
 void copier_deamon (void) {
 
   volatile int status;
-   
-  current_readers = atomic_read(&users) -1;
   
-  //printk(KERN_INFO "my_chardevice: copier_deamon! readers: %i\n", current_readers);
+  mb(); 
+  currentReaders = atomic_read(&users) -1;
+  
+  //printk(KERN_INFO "my_chardevice: copier_deamon! readers: %i\n", currentReaders);
    
-  spin_lock(&lock_buffer);
-  memcpy(ptr_BUFF_AUX, ptr_BUFF_A,CHAR_BUFFER_SIZE);
-  spin_unlock(&lock_buffer);
+  spin_lock(&lock_buff_a);
+  memcpy(ptr_BUFF_AUX, ptr_BUFF_A,BUFFER_SIZE);
+  spin_unlock(&lock_buff_a);
 
 
-  spin_lock(&lock_buffer_aux);
-  memcpy(ptr_BUFF_B, ptr_BUFF_AUX,CHAR_BUFFER_SIZE);
-  spin_unlock(&lock_buffer_aux);
+  spin_lock(&lock_buff_aux);
+  memcpy(ptr_BUFF_B, ptr_BUFF_AUX,BUFFER_SIZE);
+  spin_unlock(&lock_buff_aux);
  
   /* re-arm the timer before return */
   status = mod_timer( &timer_cpy_buffers, jiffies + msecs_to_jiffies(1000) );
@@ -147,10 +186,162 @@ int deinit_char_timer( void ) {
   return status;
 }
 
-//open function
-int dev_open(struct inode *inode, struct file *flip) {
+
+/*  *************************************************************************************************** */
+/*  ************************* read function *********************************************************** */
+/*  *************************************************************************************************** */
+
+ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
+
+ 	int status;
+ 	u8 reader;
+ 	loff_t readIndex;
+  	
+	//printk(KERN_INFO "my_chardevice: Reading BUFF_B count = %lu offset = %lld\n",count,(*f_pos));
+	
+  /* Validation of user pointers */
+	if (filp == NULL || buf == NULL || f_pos == NULL) {
+    printk(KERN_ERR "Invalid pointers in %s, %i\n",__FUNCTION__,__LINE__);
+    return -1;
+	}
+	
+	/* Get information from reader*/
+	reader = filp->private_data;
+	mb();
+	readIndex=atomic_read(&readers[reader].readIndex);
+	
+	printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[reader].readerID, readers[reader].readIndex, writeIndex);  
+
+  /* Validate readIndex is not greater than writeIndex */
+  if (readIndex > writeIndex) {
+    printk(KERN_ERR "readIndex = %lld is greater than writeIndex = %lld\n", readIndex, writeIndex);
+    return -1;
+	}  
+
+  /* Validation of the count of chars to read */
+	if (count < 0 || count > sizeof(readers[reader].readerBuffer) ) {
+    printk(KERN_ERR "Count = %lu out of buffers range\n", count);
+    return -1;
+	}
+
+  /* Something to read*/
+  if ( readIndex < writeIndex ) {
+	  /* Copy data from kernel to user */
+	    
+	  if (count > writeIndex - readIndex) {
+      count = writeIndex - readIndex;	  
+	  }
+ 	  
+ 	  spin_lock(&lock_buff_b); 
+    memcpy(readers[reader].readerBuffer, ptr_BUFF_B, BUFFER_SIZE);
+    spin_unlock(&lock_buff_b);
+    
+		status = copy_to_user(buf, readers[reader].readerBuffer+readIndex, count);
+		
+		if(status != 0) {
+		  printk(KERN_ERR "Could not copy to user space in %s, %i\n",__FUNCTION__,__LINE__);
+		  return -1;
+		}
+
+		mb();
+		atomic_set(&readers[reader].readIndex, readIndex + count);
+  	
+  	printk(KERN_INFO "my_chardevice: copied %lu bytes from kernel to user\n", count);
+  	printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[reader].readerID, readers[reader].readIndex, writeIndex);  
+    
+    return count;
+  }
+  /* Nothing to read*/
+  else
+    return 0; 
+}
+
+/*  *************************************************************************************************** */
+/*  ************************* write function ********************************************************** */
+/*  *************************************************************************************************** */
+
+ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
+
+  int status, overflow_flag = 0;
+
+  ssize_t retvalue=-ENOMEM;
+	
+  //TODO: Check input parameters?
+
+  /* Validation of user pointers */
+	if (filp == NULL || buf == NULL || f_pos == NULL) {
+    printk(KERN_ERR "Invalid pointers in %s, %i\n",__FUNCTION__,__LINE__);
+    return -1;
+	}
+  
+  //TODO: check condition of count > BUF_SIZE superposition with overflow
+  
+  /* Validation of count to write */
+	if (count < 0 || count > BUFFER_SIZE) {
+    printk(KERN_ERR "Invalid count of chars to write received in %s, %i\nTruncated to buffer size",__FUNCTION__,__LINE__);
+    count = BUFFER_SIZE;
+	}
+
+  /* Validation of offset to write */
+  if ( (* f_pos) < 0 || (* f_pos) > BUFFER_SIZE ) {
+    printk(KERN_ERR "Invalid offset of chars writen received in %s, %i\n",__FUNCTION__,__LINE__);    
+    return -1;
+  }
+
+	printk(KERN_INFO "my_chardevice: Writting to BUFF_A: %s", buf);
+	//printk(KERN_INFO "my_chardevice: Count parameter from user space %lld.\n", count);
+  //printk(KERN_INFO "my_chardevice: Offset in buffer %lld.\n",(long unsigned int)*f_pos);
+	  
+  // overflow condition
+  if ( (*f_pos) + count > BUFFER_SIZE) {
+  	count = BUFFER_SIZE - (*f_pos);
+  	overflow_flag = 1; 
+  }
+
+  if ( (*f_pos) >= BUFFER_SIZE ) {
+    printk(KERN_INFO "Buffer is already complete");
+    return 0;
+  }
+  
+  //TODO: Revisar si quiero dejar el '\0' al final de cada mensaje o no
+  spin_lock(&lock_buff_a);
+  status = strncpy_from_user( ptr_BUFF_A + (*f_pos), buf, count );
+  spin_unlock(&lock_buff_a);
+
+  *f_pos += count;
+  writeIndex = *f_pos;
+  
+  if (status < 0) {
+    printk(KERN_ERR "Could not copy from user in %s, %i\n",__FUNCTION__,__LINE__);
+    retvalue = EFAULT;
+  }
+  
+  /*
+  else if (overflow_flag) { 
+    printk(KERN_INFO "my_chardevice: DEBUG WR OVERFLOW count = %lu offset = %lld\n",count,(*f_pos));
+    retvalue = BUFFER_SIZE + 1;
+  }
+  */
+  else {
+    printk(KERN_INFO "my_chardevice: DEBUG WR count = %lu offset = %lld\n",count,(*f_pos));
+    retvalue = count;    
+  }
+  	
+  return retvalue;
+}	
+
+
+/*  *************************************************************************************************** */
+/*  ************************* open function *********************************************************** */
+/*  *************************************************************************************************** */
+
+int dev_open(struct inode *inode, struct file *filp) {
 
 	//TODO: Check input parameters?
+	
+	int currentReaderId=0;
+	//spin_lock_init(&semaphoreWrite);
+	//spin_lock_init(&reader_lock);
 
   /* First open. need to initialize things*/
   if( 0 == atomic_read(&users) ){
@@ -158,22 +349,25 @@ int dev_open(struct inode *inode, struct file *flip) {
   	printk(KERN_INFO "my_chardevice: Opening device and allocating memory for buffers");
   	
   	/* allocate memory for buffers*/
-	  ptr_BUFF_A = kzalloc(CHAR_BUFFER_SIZE*sizeof(char),GFP_KERNEL);
-	  ptr_BUFF_AUX = kzalloc(CHAR_BUFFER_SIZE*sizeof(char),GFP_KERNEL);
-	  ptr_BUFF_B = kzalloc(CHAR_BUFFER_SIZE*sizeof(char),GFP_KERNEL);
+	  ptr_BUFF_A = kzalloc(BUFFER_SIZE*sizeof(char),GFP_KERNEL);
+	  ptr_BUFF_AUX = kzalloc(BUFFER_SIZE*sizeof(char),GFP_KERNEL);
+	  ptr_BUFF_B = kzalloc(BUFFER_SIZE*sizeof(char),GFP_KERNEL);
 	
   	if (ptr_BUFF_A == NULL || ptr_BUFF_AUX == NULL || ptr_BUFF_B == NULL) {
       printk(KERN_ERR "Could not allocate memory for BUFFERs in %s, %i\n",__FUNCTION__,__LINE__);
       return -1;
   	}
     
-    /* initialize syncronization spinlocks and mutex */  	
-  	spin_lock_init(&lock_buffer);
-    spin_lock_init(&lock_buffer_aux);
+    /* initialize syncronization spinlocks and mutexs */  	
+  	spin_lock_init(&lock_buff_a);
+    spin_lock_init(&lock_buff_aux);
+    spin_lock_init(&lock_buff_b);
     
     //sema_init(&sema_buff_a, 0);
 
     //mutex_init(&mutex_buff_a);
+    
+    init_reader_struct();
     
     /* initialization of the timer that triggers the copy from buff_a to buff_aux */
     init_char_timer();
@@ -181,16 +375,35 @@ int dev_open(struct inode *inode, struct file *flip) {
   }  
   /* things already initialized */
   else {
-    printk(KERN_INFO "my_chardevice: opening device from reader side %i\n",atomic_read(&users));
+    //printk(KERN_INFO "my_chardevice: reader %i is opening the device\n",atomic_read(&users));
+    
+    mb() ;
+		currentReaderId=atomic_read(&users)-1;
+		
+		mb() ;
+		readers[currentReaderId].readerID = currentReaderId;	
+		
+		filp->private_data = currentReaderId;
+		
+		readers[currentReaderId].readerBuffer[0] = '\0';
+		
+		//driverReaders[readerId-1].readIndex = ATOMIC_INIT(0);
+		
+		printk("Reader %i logged in with ID %d on filp->private_data\n",atomic_read(&users),filp->private_data);
+				
   }
   
-  //TODO: memory barriers needed?
+  //TODO: check if mb() is really needed here
+  mb();
   atomic_inc(&users);
   
 	return 0;
 }
 
-//close function
+/*  *************************************************************************************************** */
+/*  ************************* close function ********************************************************** */
+/*  *************************************************************************************************** */
+
 int dev_close(struct inode *inode, struct file *flip){
 
   //TODO: Check input parameters?
@@ -213,142 +426,6 @@ int dev_close(struct inode *inode, struct file *flip){
   return 0;
 }
 
-// Read function //
-ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
-
- 	int status;
-  	
-	//printk(KERN_INFO "my_chardevice: Reading BUFF_B count = %lu offset = %lld\n",count,(*f_pos));
-	
-  /* Validation of user pointers */
-	if (filp == NULL || buf == NULL || f_pos == NULL) {
-    printk(KERN_ERR "Invalid pointers in %s, %i\n",__FUNCTION__,__LINE__);
-    return -1;
-	}
-
-  /* Validation of the reader offset */
-  if ( (* f_pos) < 0 || (* f_pos) > CHAR_BUFFER_SIZE - 1 ) {
-    printk(KERN_INFO "Offset value out of range received from user in %s, %i\n",__FUNCTION__,__LINE__);    
-    return -1;
-  }
-
-  /* Validate read index f_pos is not greater than write_index */
-  if ((*f_pos) > write_index) {
-    printk(KERN_ERR "read_index = %lld is greater than write_index = %lld\n", *f_pos, write_index);
-    return -1;
-	}  
-
-  /* Validation of the count of chars to read */
-	if (count < 0 || count > (CHAR_BUFFER_SIZE - (*f_pos) ) ) {
-    //printk(KERN_ERR "%lu is an invalid number of chars to read\n", count);
-    count = CHAR_BUFFER_SIZE  - (*f_pos);
-	}
-
-  
-  /* Something new since last reading */
-	//if ( *(ptr_BUFF_B + (*f_pos) ) != '\0') {
-	
-
-  if ( (*f_pos) < write_index ) {
-	  /* Copy data from kernel to user */
-	  
-	  /* user asked for more or exactly the number of available chars         
-	   * count should be only de difference between de write and read indexes.
-	   * +1 to include de '\0' string delimiter */
-	   
-	  if (count >= write_index - (*f_pos)) {
-      count = write_index - (*f_pos);	  
-	  }
- 	  	  
-	  printk(KERN_INFO "my_chardevice: copying %lu bytes from kernel to user\n", count);
-    status = copy_to_user(buf, ptr_BUFF_B + (*f_pos), count ); 
-	
-  	if (status != 0) {  
-    	printk(KERN_ERR "Could not copy to user in %s, %i\n",__FUNCTION__,__LINE__);
-    	return -1;
-    }
-	
-	  else {
-      *f_pos += count;
-      printk(KERN_INFO "\nmy_chardevice: DEBUG RD write_index = %lld count = %lu offset = %lld\n\n", write_index, count, (*f_pos));
-	    return count;
-    }
-  }
-  /* Nothing to read*/
-  else
-    return 0; 
-}
-
-// Write function //
-ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
-
-  int status, overflow_flag = 0;
-
-  ssize_t retvalue=-ENOMEM;
-	
-  //TODO: Check input parameters?
-
-  /* Validation of user pointers */
-	if (filp == NULL || buf == NULL || f_pos == NULL) {
-    printk(KERN_ERR "Invalid pointers in %s, %i\n",__FUNCTION__,__LINE__);
-    return -1;
-	}
-  
-  //TODO: check condition of count > BUF_SIZE superposition with overflow
-  
-  /* Validation of count to write */
-	if (count < 0 || count > CHAR_BUFFER_SIZE) {
-    printk(KERN_ERR "Invalid count of chars to write received in %s, %i\nTruncated to buffer size",__FUNCTION__,__LINE__);
-    count = CHAR_BUFFER_SIZE;
-	}
-
-  /* Validation of offset to write */
-  if ( (* f_pos) < 0 || (* f_pos) > CHAR_BUFFER_SIZE ) {
-    printk(KERN_ERR "Invalid offset of chars writen received in %s, %i\n",__FUNCTION__,__LINE__);    
-    return -1;
-  }
-
-	printk(KERN_INFO "my_chardevice: Writting to BUFF_A: %s", buf);
-	//printk(KERN_INFO "my_chardevice: Count parameter from user space %lld.\n", count);
-  //printk(KERN_INFO "my_chardevice: Offset in buffer %lld.\n",(long unsigned int)*f_pos);
-	  
-  // overflow condition
-  if ( (*f_pos) + count > CHAR_BUFFER_SIZE) {
-  	count = CHAR_BUFFER_SIZE - (*f_pos);
-  	overflow_flag = 1; 
-  }
-
-  if ( (*f_pos) >= CHAR_BUFFER_SIZE ) {
-    printk(KERN_INFO "Buffer is already complete");
-    return 0;
-  }
-  
-  //TODO: Revisar si quiero dejar el '\0' al final de cada mensaje o no
-  spin_lock(&lock_buffer);
-  status = strncpy_from_user( ptr_BUFF_A + (*f_pos), buf, count );
-  spin_unlock(&lock_buffer);
-
-  *f_pos += count;
-  write_index = *f_pos;
-  
-  if (status < 0) {
-    printk(KERN_ERR "Could not copy from user in %s, %i\n",__FUNCTION__,__LINE__);
-    retvalue = EFAULT;
-  }
-  
-  /*
-  else if (overflow_flag) { 
-    printk(KERN_INFO "my_chardevice: DEBUG WR OVERFLOW count = %lu offset = %lld\n",count,(*f_pos));
-    retvalue = CHAR_BUFFER_SIZE + 1;
-  }
-  */
-  else {
-    printk(KERN_INFO "my_chardevice: DEBUG WR count = %lu offset = %lld\n",count,(*f_pos));
-    retvalue = count;    
-  }
-  	
-  return retvalue;
-}	
 
 
 struct file_operations dev_fops = { //Struct File Operations, this module only supports read...
