@@ -60,20 +60,21 @@ int main (int argc, char ** argv){
   while(1) {
   
     nbytes = read(fd, data, BUF_SIZE);
-    
+       
+    if (nbytes > 1) {
+      printf("Read from kernel space: %s\n", data);  
+    }
+   
     if(nbytes == -1) {
-    	perror("ERROR: Could not read from my_chardevice :(\n");
-    	break;
+    	printf("ERROR: Could not read from my_chardevice :(\n");
+    	goto exit;
     }
     
-    if (nbytes > 0) {
-      printf("Read from kernel space: %s\n", data);
-    }
-
-    sleep(2);
+    sleep(1);
+    
   }
 
-  printf("Finishing reading test\n");
+exit:printf("Finishing reading test\n");
     
  
   close(fd);

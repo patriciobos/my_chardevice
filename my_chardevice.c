@@ -84,10 +84,13 @@ static atomic_t users=ATOMIC_INIT(0);
 
 
 //TODO: check writeIndex data type.  there are some comparisons between loff_t and atomic_t?
-static loff_t writeIndex = 0;
-static loff_t globalReadIndex = 0;
+static atomic_t writeIndex = ATOMIC_INIT(0);;
+
+//static loff_t globalReadIndex = 0;
 
 static unsigned int currentReaders;
+static unsigned int overflow_flag = 0;
+static unsigned int killThemAll = 0;
 
 static struct timer_list timer_cpy_buffers;
 
@@ -117,6 +120,7 @@ void init_reader_struct(void)
 		//readers[i].readIndex = 0;
 		//spin_lock_init(&readers[i].readerSpinlock);
 		mutex_init(&readers[i].readerMutex);
+		mutex_lock(&readers[i].readerMutex);
 		readers[i].readerLock = 0;
 		readers[i].readerBuffer[0] = 0;
 	}
@@ -127,7 +131,7 @@ void copier_deamon (void) {
   volatile int status;
   
   mb(); 
-  currentReaders = atomic_read(&users) -1;
+  currentReaders = atomic_read(&users) - 1;
   
   //printk(KERN_INFO "my_chardevice: copier_deamon! readers: %i\n", currentReaders);
    
@@ -194,27 +198,30 @@ int deinit_char_timer( void ) {
 ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
 
  	int status;
+ 	
+ 	int readIndexLocal, writeIndexLocal;
+ 	
  	u8 actualReader;
  	loff_t readIndex;
-  	
-	//printk(KERN_INFO "my_chardevice: Reading BUFF_B count = %lu offset = %lld\n",count,(*f_pos));
-	
+  
+  /* Get information from actualReader*/
+	actualReader = filp->private_data;
+	mb();
+	readIndexLocal = atomic_read(&readers[actualReader].readIndex);
+	mb();
+	writeIndexLocal = atomic_read(&writeIndex);
+  
+  printk(KERN_INFO "\n\DEBUG reader %i: readIndex = %d, writeIndex = %d\n",actualReader, readIndexLocal, writeIndexLocal);  
+  		
   /* Validation of user pointers */
 	if (filp == NULL || buf == NULL || f_pos == NULL) {
     printk(KERN_ERR "Invalid pointers in %s, %i\n",__FUNCTION__,__LINE__);
     return -1;
-	}
-	
-	/* Get information from actualReader*/
-	actualReader = filp->private_data;
-	mb();
-	readIndex=atomic_read(&readers[actualReader].readIndex);
-	
-	printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[actualReader].readerID, readers[actualReader].readIndex, writeIndex);  
+	}	
 
   /* Validate readIndex is not greater than writeIndex */
-  if (readIndex > writeIndex) {
-    printk(KERN_ERR "readIndex = %lld is greater than writeIndex = %lld\n", readIndex, writeIndex);
+  if (readIndexLocal > writeIndexLocal) {
+    printk(KERN_ERR "readIndex = %d is greater than writeIndex = %d\n", readIndexLocal, writeIndexLocal);
     return -1;
 	}  
 
@@ -223,20 +230,27 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
     printk(KERN_ERR "Count = %lu out of buffers range\n", count);
     return -1;
 	}
+  
+  //TODO: check overflow condition and if writer hasn't exit
 
+  if (readIndexLocal == writeIndexLocal) { 
+    printk(KERN_INFO "DEBUG reader %i: Nothing new to read, going to sleep\n", actualReader); 
+    mutex_lock(&readers[actualReader].readerMutex);
+  }
+  
   /* Something to read*/
-  if ( readIndex < writeIndex ) {
+  if ( readIndexLocal < writeIndexLocal ) {
 	  /* Copy data from kernel to user */
 	    
-	  if (count > writeIndex - readIndex) {
-      count = writeIndex - readIndex;	  
+	  if (count > writeIndexLocal - readIndexLocal) {
+      count = writeIndexLocal - readIndexLocal;	  
 	  }
  	  
  	  spin_lock(&lock_buff_b); 
     memcpy(readers[actualReader].readerBuffer, ptr_BUFF_B, BUFFER_SIZE);
     spin_unlock(&lock_buff_b);
     
-		status = copy_to_user(buf, readers[actualReader].readerBuffer+readIndex, count);
+		status = copy_to_user(buf, (readers[actualReader].readerBuffer)+readIndexLocal, count);
 		
 		if(status != 0) {
 		  printk(KERN_ERR "Could not copy to user space in %s, %i\n",__FUNCTION__,__LINE__);
@@ -244,18 +258,21 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
 		}
 
 		mb();
-		atomic_set(&readers[actualReader].readIndex, readIndex + count);
+		atomic_set(&readers[actualReader].readIndex, readIndexLocal + count);
   	
-  	printk(KERN_INFO "my_chardevice: copied %lu bytes from kernel to user\n", count);
-  	//printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[actualReader].readerID, readers[actualReader].readIndex, writeIndex);  
+  	printk(KERN_INFO "DEBUG reader %i: copied %lu bytes from kernel to user\n",actualReader, count);
     
     return count;
   }
   /* Nothing to read*/
-  else if (readIndex == writeIndex) { 
-    printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[actualReader].readerID, readers[actualReader].readIndex, writeIndex);
-    printk(KERN_INFO "DEBUG Nothing to new to read, reader = %i is going to sleep zzzzz", readers[actualReader].readerID);
-    mutex_lock(&readers[actualReader].readerMutex);
+  else if (readIndexLocal == writeIndexLocal) { 
+        
+    if (killThemAll == 1) {
+      
+      printk(KERN_INFO "DEBUG reader %i: Writer is gone, I will exit too\n", actualReader);
+      return -1;
+    }
+    
   }
     return 0; 
 }
@@ -266,10 +283,12 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
 
 ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
 
-  int status, overflow_flag = 0;
-  
+  int status, writeIndexLocal;
   u8 i;
-
+  
+  mb();
+	writeIndexLocal = atomic_read(&writeIndex);
+	
   ssize_t retvalue=-ENOMEM;
 	
   //TODO: Check input parameters?
@@ -288,25 +307,23 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
     return -1;
 	}
 	
-  if (count > BUFFER_SIZE - writeIndex) {
-    printk(KERN_INFO "Count = %d exceeds buffer free spece = %d.  Overflow condition detected", count, (BUFFER_SIZE - writeIndex) );
+  if (count > BUFFER_SIZE - writeIndexLocal) {
+    printk(KERN_INFO "Count = %d exceeds buffer free spece = %d.  Overflow condition detected", count, (BUFFER_SIZE - writeIndexLocal) );
     overflow_flag = 1;
-    count = BUFFER_SIZE - writeIndex;
+    count = BUFFER_SIZE - writeIndexLocal;
   }
 
-	printk(KERN_INFO "my_chardevice: Writting to BUFF_A: %d chars of %s", count, buf);
-	//printk(KERN_INFO "my_chardevice: Count parameter from user space %lld.\n", count);
-  //printk(KERN_INFO "my_chardevice: Offset in buffer %lld.\n",(long unsigned int)*f_pos);
+	printk(KERN_INFO "\nDEBUG writer: Writting to BUFF_A: %s, chars = %lu, free space = %d\n",buf, count, BUFFER_SIZE - writeIndexLocal );
 	  
  
-  if ( (*f_pos) >= BUFFER_SIZE ) {
+  if ( writeIndexLocal >= BUFFER_SIZE ) {
     printk(KERN_INFO "Buffer is already complete");
     return 0;
   }
   
   //TODO: Revisar si quiero dejar el '\0' al final de cada mensaje o no
   spin_lock(&lock_buff_a);
-  status = strncpy_from_user( ptr_BUFF_A + (*f_pos), buf, count );
+  status = strncpy_from_user( ptr_BUFF_A + writeIndexLocal, buf, count );
   spin_unlock(&lock_buff_a);
 
   if (status < 0) {
@@ -315,14 +332,15 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
   }
  
   else {
-    printk(KERN_INFO "my_chardevice: DEBUG WR count = %lu offset = %lld\n",count,(*f_pos));
-    writeIndex += count;
+    printk(KERN_INFO "DEBUG writer: count = %lu writeIndex = %d\n",count, writeIndexLocal);
+    //writeIndexLocal += count;
   
     mb(); 
-    currentReaders = atomic_read(&users) - 1;
-  
-    for (i=0;i<=currentReaders;i++) {
+    atomic_set(&writeIndex, writeIndexLocal + count);
+      
+    for (i=0;i<atomic_read(&users)-1;i++) {
       mutex_unlock(&readers[i].readerMutex);
+      printk(KERN_INFO "DEBUG writer: unlocked mutex for reader %i \n", i);
     }
     
     retvalue = count;    
@@ -341,13 +359,18 @@ int dev_open(struct inode *inode, struct file *filp) {
 	//TODO: Check input parameters?
 	
 	int currentReaderId=0;
-	//spin_lock_init(&semaphoreWrite);
-	//spin_lock_init(&reader_lock);
-
+	
   /* First open. need to initialize things*/
   if( 0 == atomic_read(&users) ){
 	
   	printk(KERN_INFO "my_chardevice: Opening device and allocating memory for buffers");
+  	
+  	filp->private_data = MAX_READERS;  // reader are in range 0:MAX_READERS-1 so write ID es MAX_READERS
+  	
+  	atomic_set(&writeIndex,0);
+  	
+  	overflow_flag = 0;
+  	killThemAll = 0;
   	
   	/* allocate memory for buffers*/
 	  ptr_BUFF_A = kzalloc(BUFFER_SIZE*sizeof(char),GFP_KERNEL);
@@ -364,10 +387,7 @@ int dev_open(struct inode *inode, struct file *filp) {
     spin_lock_init(&lock_buff_aux);
     spin_lock_init(&lock_buff_b);
     
-    //sema_init(&sema_buff_a, 0);
-
-    //mutex_init(&mutex_buff_a);
-    
+       
     init_reader_struct();
     
     /* initialization of the timer that triggers the copy from buff_a to buff_aux */
@@ -376,21 +396,17 @@ int dev_open(struct inode *inode, struct file *filp) {
   }  
   /* things already initialized */
   else {
-    //printk(KERN_INFO "my_chardevice: reader %i is opening the device\n",atomic_read(&users));
-    
+        
     mb() ;
-		currentReaderId=atomic_read(&users)-1;
+		currentReaderId=atomic_read(&users) - 1;
 		
-		mb() ;
 		readers[currentReaderId].readerID = currentReaderId;	
 		
 		filp->private_data = currentReaderId;
 		
 		readers[currentReaderId].readerBuffer[0] = '\0';
-		
-		//driverReaders[readerId-1].readIndex = ATOMIC_INIT(0);
-		
-		printk("Reader %i logged in with ID %d on filp->private_data\n",atomic_read(&users),filp->private_data);
+				
+		printk("DEBUG Reader %d: logged in\n",filp->private_data);
 				
   }
   
@@ -405,9 +421,24 @@ int dev_open(struct inode *inode, struct file *filp) {
 /*  ************************* close function ********************************************************** */
 /*  *************************************************************************************************** */
 
-int dev_close(struct inode *inode, struct file *flip){
+int dev_close(struct inode *inode, struct file *filp){
 
   //TODO: Check input parameters?
+  
+  u8 i, usersLogged;
+    
+  if (filp->private_data == MAX_READERS) {
+    
+    killThemAll = 1;    // Signal to close all readers instances
+    
+    mb(); 
+ 
+    for (i=0;i<atomic_read(&users)-1;i++) {
+      mutex_unlock(&readers[i].readerMutex);
+      printk(KERN_INFO "my_chardevice: DEBUG Unlock mutex of reader %i \n", i);
+    }
+  }
+  
   
   if(!atomic_dec_and_test(&users)) {
     printk(KERN_INFO "my_chardevice: Closing device, %i users remaining\n",atomic_read(&users));
@@ -420,21 +451,24 @@ int dev_close(struct inode *inode, struct file *flip){
    	kfree(ptr_BUFF_AUX);
    	kfree(ptr_BUFF_B);
    	
-   	deinit_char_timer();
+//   	deinit_char_timer();
+   	del_timer(&timer_cpy_buffers);
 
   }
   
   return 0;
 }
 
+/*  *************************************************************************************************** */
+/*  ************************* File operations ********************************************************* */
+/*  *************************************************************************************************** */
 
-
-struct file_operations dev_fops = { //Struct File Operations, this module only supports read...
+struct file_operations dev_fops = { 
 	.open = dev_open,
   .release = dev_close,
 	.read = dev_read,
 	.write = dev_write,
-	.owner = THIS_MODULE,           // Tells who is owner of struct file_operations
+	.owner = THIS_MODULE,           
 };
 
 
