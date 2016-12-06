@@ -39,7 +39,7 @@
 #include <linux/version.h>
 #include <linux/uaccess.h>
 
-//#include <linux/mutex.h>
+#include <linux/mutex.h>
 #include <linux/semaphore.h>
 #include <linux/errno.h>      /* Standard error numbers definitions */
 
@@ -97,7 +97,7 @@ typedef struct readerControl
 	loff_t readIndex; 
 	int readerLock;
 //	spinlock_t readerSpinlock;
-  mutex_t readerMutex;
+  struct mutex readerMutex;
 	char readerBuffer[BUFFER_SIZE];
 } readerControl_t;
 
@@ -162,7 +162,7 @@ int init_char_timer( void ) {
   status = mod_timer( &timer_cpy_buffers, jiffies + msecs_to_jiffies(1000) );
   
   if (status != 0) {
-    printk(KERN_ERR "Error in timer inizialization in %s, %i\n",__FUNCTION__,__LINE__);
+    printk(KERN_ERR "Error in timer initialization in %s, %i\n",__FUNCTION__,__LINE__);
     return status;
   }
   
@@ -174,7 +174,7 @@ int deinit_char_timer( void ) {
 
   int status;
 
-  printk(KERN_INFO "my_chardevice: de-inizialization of the timer\n");
+  printk(KERN_INFO "my_chardevice: de-initialization of the timer\n");
   
   status = del_timer( &timer_cpy_buffers );
   
@@ -194,7 +194,7 @@ int deinit_char_timer( void ) {
 ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
 
  	int status;
- 	u8 reader;
+ 	u8 actualReader;
  	loff_t readIndex;
   	
 	//printk(KERN_INFO "my_chardevice: Reading BUFF_B count = %lu offset = %lld\n",count,(*f_pos));
@@ -205,12 +205,12 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
     return -1;
 	}
 	
-	/* Get information from reader*/
-	reader = filp->private_data;
+	/* Get information from actualReader*/
+	actualReader = filp->private_data;
 	mb();
-	readIndex=atomic_read(&readers[reader].readIndex);
+	readIndex=atomic_read(&readers[actualReader].readIndex);
 	
-	printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[reader].readerID, readers[reader].readIndex, writeIndex);  
+	printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[actualReader].readerID, readers[actualReader].readIndex, writeIndex);  
 
   /* Validate readIndex is not greater than writeIndex */
   if (readIndex > writeIndex) {
@@ -219,7 +219,7 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
 	}  
 
   /* Validation of the count of chars to read */
-	if (count < 0 || count > sizeof(readers[reader].readerBuffer) ) {
+	if (count < 0 || count > sizeof(readers[actualReader].readerBuffer) ) {
     printk(KERN_ERR "Count = %lu out of buffers range\n", count);
     return -1;
 	}
@@ -233,10 +233,10 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
 	  }
  	  
  	  spin_lock(&lock_buff_b); 
-    memcpy(readers[reader].readerBuffer, ptr_BUFF_B, BUFFER_SIZE);
+    memcpy(readers[actualReader].readerBuffer, ptr_BUFF_B, BUFFER_SIZE);
     spin_unlock(&lock_buff_b);
     
-		status = copy_to_user(buf, readers[reader].readerBuffer+readIndex, count);
+		status = copy_to_user(buf, readers[actualReader].readerBuffer+readIndex, count);
 		
 		if(status != 0) {
 		  printk(KERN_ERR "Could not copy to user space in %s, %i\n",__FUNCTION__,__LINE__);
@@ -244,15 +244,19 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
 		}
 
 		mb();
-		atomic_set(&readers[reader].readIndex, readIndex + count);
+		atomic_set(&readers[actualReader].readIndex, readIndex + count);
   	
   	printk(KERN_INFO "my_chardevice: copied %lu bytes from kernel to user\n", count);
-  	printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[reader].readerID, readers[reader].readIndex, writeIndex);  
+  	//printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[actualReader].readerID, readers[actualReader].readIndex, writeIndex);  
     
     return count;
   }
   /* Nothing to read*/
-  else
+  else if (readIndex == writeIndex) { 
+    printk(KERN_INFO "DEBUG Reader = %i, readIndex = %lld, writeIndex = %lld\n", readers[actualReader].readerID, readers[actualReader].readIndex, writeIndex);
+    printk(KERN_INFO "DEBUG Nothing to new to read, reader = %i is going to sleep zzzzz", readers[actualReader].readerID);
+    mutex_lock(&readers[actualReader].readerMutex);
+  }
     return 0; 
 }
 
@@ -263,6 +267,8 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
 ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
 
   int status, overflow_flag = 0;
+  
+  u8 i;
 
   ssize_t retvalue=-ENOMEM;
 	
@@ -277,27 +283,22 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
   //TODO: check condition of count > BUF_SIZE superposition with overflow
   
   /* Validation of count to write */
-	if (count < 0 || count > BUFFER_SIZE) {
-    printk(KERN_ERR "Invalid count of chars to write received in %s, %i\nTruncated to buffer size",__FUNCTION__,__LINE__);
-    count = BUFFER_SIZE;
-	}
-
-  /* Validation of offset to write */
-  if ( (* f_pos) < 0 || (* f_pos) > BUFFER_SIZE ) {
-    printk(KERN_ERR "Invalid offset of chars writen received in %s, %i\n",__FUNCTION__,__LINE__);    
+	if (count < 0 ) {
+    printk(KERN_ERR "Invalid count of chars to write in %s, %i\n",__FUNCTION__,__LINE__);
     return -1;
+	}
+	
+  if (count > BUFFER_SIZE - writeIndex) {
+    printk(KERN_INFO "Count = %d exceeds buffer free spece = %d.  Overflow condition detected", count, (BUFFER_SIZE - writeIndex) );
+    overflow_flag = 1;
+    count = BUFFER_SIZE - writeIndex;
   }
 
-	printk(KERN_INFO "my_chardevice: Writting to BUFF_A: %s", buf);
+	printk(KERN_INFO "my_chardevice: Writting to BUFF_A: %d chars of %s", count, buf);
 	//printk(KERN_INFO "my_chardevice: Count parameter from user space %lld.\n", count);
   //printk(KERN_INFO "my_chardevice: Offset in buffer %lld.\n",(long unsigned int)*f_pos);
 	  
-  // overflow condition
-  if ( (*f_pos) + count > BUFFER_SIZE) {
-  	count = BUFFER_SIZE - (*f_pos);
-  	overflow_flag = 1; 
-  }
-
+ 
   if ( (*f_pos) >= BUFFER_SIZE ) {
     printk(KERN_INFO "Buffer is already complete");
     return 0;
@@ -308,22 +309,22 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
   status = strncpy_from_user( ptr_BUFF_A + (*f_pos), buf, count );
   spin_unlock(&lock_buff_a);
 
-  *f_pos += count;
-  writeIndex = *f_pos;
-  
   if (status < 0) {
-    printk(KERN_ERR "Could not copy from user in %s, %i\n",__FUNCTION__,__LINE__);
-    retvalue = EFAULT;
+    printk(KERN_ERR "Could not copy from user to kernel in %s, %i\n",__FUNCTION__,__LINE__);
+    retvalue = -EFAULT;
   }
-  
-  /*
-  else if (overflow_flag) { 
-    printk(KERN_INFO "my_chardevice: DEBUG WR OVERFLOW count = %lu offset = %lld\n",count,(*f_pos));
-    retvalue = BUFFER_SIZE + 1;
-  }
-  */
+ 
   else {
     printk(KERN_INFO "my_chardevice: DEBUG WR count = %lu offset = %lld\n",count,(*f_pos));
+    writeIndex += count;
+  
+    mb(); 
+    currentReaders = atomic_read(&users) - 1;
+  
+    for (i=0;i<=currentReaders;i++) {
+      mutex_unlock(&readers[i].readerMutex);
+    }
+    
     retvalue = count;    
   }
   	
