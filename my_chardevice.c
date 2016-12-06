@@ -326,7 +326,7 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
     }
     
     retvalue = count;    
-  }
+  } 
   	
   return retvalue;
 }	
