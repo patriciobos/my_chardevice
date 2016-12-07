@@ -285,7 +285,10 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
   mb();
 	writeIndexLocal = atomic_read(&writeIndex);
 	
-
+  if (filp->private_data != (void *)MAX_READERS) {
+    printk(KERN_ERR "forcing ID of writer to MAX_READERS\n");
+    filp->private_data = (void *)MAX_READERS;
+    }
 	
   //TODO: Check input parameters?
 
@@ -333,7 +336,8 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
   
     if (overflow_flag == 1) {
       *(ptr_BUFF_A + writeIndexLocal + count + 1) = '\0';
-      count++;       	
+      count++;
+             	
     }
     
     mb(); 
@@ -430,14 +434,14 @@ int dev_close(struct inode *inode, struct file *filp){
   u8 i;
     
   if (filp->private_data == (void *)MAX_READERS) {
-    
+    printk(KERN_INFO "DEBUG: writer is exiting, sending signal to reader to exit too\n");
     killThemAll = 1;    // Signal to close all readers instances
     
     mb(); 
  
     for (i=0;i<atomic_read(&users)-1;i++) {
       mutex_unlock(&readers[i].readerMutex);
-      printk(KERN_INFO "my_chardevice: DEBUG Unlock mutex of reader %i \n", i);
+      printk(KERN_INFO "DEBUG: mutex_unlock so reader %i can exit\n", i);
     }
   }
   
@@ -453,8 +457,9 @@ int dev_close(struct inode *inode, struct file *filp){
    	kfree(ptr_BUFF_AUX);
    	kfree(ptr_BUFF_B);
    	
-   	deinit_char_timer();
-//   	del_timer(&timer_cpy_buffers);
+   	//deinit_char_timer();
+   	del_timer_sync(&timer_cpy_buffers);
+
 
   }
   

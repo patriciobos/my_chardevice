@@ -57,23 +57,22 @@ int main (int argc, char ** argv){
   
     printf("writer -> Enter string to copy: ");	  
     fgets(data, BUF_SIZE, stdin);
-    printf("String received: %s", data);
     
     nbytes = write(fd,data,strlen(data));
     
-    if(nbytes == -1) {
+    if(nbytes < 0) {
     	perror("Could not write to my_chardevice :(\n");
     	break;
     }
+    
+    printf("writer -> %d of %lu bytes copied\n",nbytes, strlen(data));
+    
+    sleep(.5);
     
     if(nbytes == 0 || nbytes < strlen(data)) {
       printf("Buffer is already full. Exiting...\n ");	
     	break;
     }
-        
-    printf("writer -> %lu bytes copied\n",strlen(data));
-
-
   }  
   
   close(fd);

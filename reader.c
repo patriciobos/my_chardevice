@@ -61,8 +61,8 @@ int main (int argc, char ** argv){
   
     nbytes = read(fd, data, BUF_SIZE);
        
-    if (nbytes > 1) {
-      printf("Read from kernel space: %s\n", data);  
+    if (nbytes > 0) {
+      printf("Read from kernel space: %.*s\n", nbytes, data );  
     }
    
     if(nbytes == -1) {
@@ -70,7 +70,7 @@ int main (int argc, char ** argv){
     	goto exit;
     }
     
-    sleep(1);
+    sleep(2);
     
   }
 
