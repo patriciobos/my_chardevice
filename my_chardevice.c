@@ -309,7 +309,7 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
   if (count > BUFFER_SIZE - writeIndexLocal) {
     printk(KERN_INFO "Count = %lu exceeds buffer free space = %d.  Overflow condition detected", count, (BUFFER_SIZE - writeIndexLocal) );
     overflow_flag = 1;
-    count = BUFFER_SIZE - writeIndexLocal - 1;  // with room for a final '\0'
+    count = BUFFER_SIZE - writeIndexLocal - 1;
   }
 
 	printk(KERN_INFO "\nDEBUG writer: Writting to BUFF_A: %s", buf );
@@ -320,7 +320,6 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
     return 0;
   }
   
-  //TODO: Revisar si quiero dejar el '\0' al final de cada mensaje o no
   spin_lock(&lock_buff_a);
   status = strncpy_from_user( ptr_BUFF_A + writeIndexLocal, buf, count );
   spin_unlock(&lock_buff_a);
@@ -366,17 +365,17 @@ int dev_open(struct inode *inode, struct file *filp) {
 	
 	int currentReaderId=0;
 	
-  /* First open. need to initialize things*/
+  /* First open from writer.  Need to initialize things*/
   if( 0 == atomic_read(&users) ){
 	
   	printk(KERN_INFO "my_chardevice: Opening device and allocating memory for buffers");
   	
-  	filp->private_data = (void *)MAX_READERS;  // reader are in range 0:MAX_READERS-1 so write ID es MAX_READERS
+  	filp->private_data = (void *)MAX_READERS;  // reader are in range 0:MAX_READERS-1 so writer ID is MAX_READERS
   	
   	atomic_set(&writeIndex,0);
   	
-  	overflow_flag = 0;
-  	killThemAll = 0;
+  	overflow_flag = 0;  // signal to indicate that the string copied from user space exceeds writer's buffer size
+  	killThemAll = 0;    // signal to terminate of readers intances
   	
   	/* allocate memory for buffers*/
 	  ptr_BUFF_A = kzalloc(BUFFER_SIZE*sizeof(char),GFP_KERNEL);
@@ -388,19 +387,19 @@ int dev_open(struct inode *inode, struct file *filp) {
       return -1;
   	}
     
-    /* initialize syncronization spinlocks and mutexs */  	
+    /* initialize spinlocks */  	
   	spin_lock_init(&lock_buff_a);
     spin_lock_init(&lock_buff_aux);
     spin_lock_init(&lock_buff_b);
     
-       
+    /* initialize reader's control struct*/
     init_reader_struct();
     
-    /* initialization of the timer that triggers the copy from buff_a to buff_aux */
+    /* initialize the timer that triggers the copy of buffers*/
     init_char_timer();
     
   }  
-  /* things already initialized */
+  /* Open from reader. Things already initialized */
   else {
         
     mb() ;
@@ -412,12 +411,10 @@ int dev_open(struct inode *inode, struct file *filp) {
 		
 		readers[currentReaderId].readerBuffer[0] = '\0';
 				
-		printk("DEBUG Reader %ld: logged in\n",(long) filp->private_data);
+		printk("\nDEBUG: Reader %ld: logged in\n",(long) filp->private_data);
 				
   }
   
-  //TODO: check if mb() is really needed here
-  mb();
   atomic_inc(&users);
   
 	return 0;
