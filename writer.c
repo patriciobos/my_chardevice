@@ -31,13 +31,10 @@
 #include <string.h>
 
 #define BUF_SIZE 32
-#define MAX_LOOPS 10
 
 int main (int argc, char ** argv){
 
   int fd;
-
-  int loops = 0;
 
   int status, nbytes;
   
@@ -55,26 +52,28 @@ int main (int argc, char ** argv){
     return -1;
   }
  
-  while(loops < MAX_LOOPS) {
+  while(1) {
   
-    fgets(data,BUF_SIZE,stdin);
+  
+    printf("writer -> Enter string to copy: ");	  
+    fgets(data, BUF_SIZE, stdin);
     printf("String received: %s", data);
     
-    status = write(fd,data,strlen(data));
+    nbytes = write(fd,data,strlen(data));
     
-    if(status == -1) {
+    if(nbytes == -1) {
     	perror("Could not write to my_chardevice :(\n");
     	break;
     }
     
-    if(status == 0) {
+    if(nbytes == 0 || nbytes < strlen(data)) {
       printf("Buffer is already full. Exiting...\n ");	
     	break;
     }
         
-    printf(" %lu bytes copied\n",strlen(data));
-    loops++;
-    pause;
+    printf("writer -> %lu bytes copied\n",strlen(data));
+
+
   }  
   
   close(fd);

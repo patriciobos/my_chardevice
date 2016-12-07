@@ -65,10 +65,6 @@ struct semaphore sema_buff_a;
 struct semaphore sema_buff_aux;
 struct semaphore sema_buff_b;
 
-
-
-
-
 /* --------------------------------- */
 
 /* Private global variable definitions */
@@ -96,9 +92,9 @@ static struct timer_list timer_cpy_buffers;
 
 typedef struct readerControl
 {
-	u8 readerID;
+	int readerID;
 	loff_t readIndex; 
-	int readerLock;
+//	int readerLock;
 //	spinlock_t readerSpinlock;
   struct mutex readerMutex;
 	char readerBuffer[BUFFER_SIZE];
@@ -114,14 +110,15 @@ void init_reader_struct(void)
 	
 	for(i=0; i<MAX_READERS; i++)
 	{	
-		readers[i].readerID = 0;
-		mb();
-		atomic_set(&readers[i].readIndex,0);
+		readers[i].readerID = -1;
+		readers[i].readIndex = 0;
+		//mb();
+		//atomic_set(&readers[i].readIndex,0);
 		//readers[i].readIndex = 0;
 		//spin_lock_init(&readers[i].readerSpinlock);
 		mutex_init(&readers[i].readerMutex);
 		mutex_lock(&readers[i].readerMutex);
-		readers[i].readerLock = 0;
+		//readers[i].readerLock = 0;
 		readers[i].readerBuffer[0] = 0;
 	}
 }
@@ -157,37 +154,34 @@ int init_char_timer( void ) {
 
   int status;
 
-  printk(KERN_INFO "my_chardevice: initialization of the timer\n");
+  printk(KERN_INFO "my_chardevice: initializing the timer\n");
 
-  setup_timer( &timer_cpy_buffers, copier_deamon, 0 );
+  setup_timer( &timer_cpy_buffers, (void *)copier_deamon, 0 );
 
   //printk( "Starting timer to fire in 800ms (%ld)\n", jiffies );
   
   status = mod_timer( &timer_cpy_buffers, jiffies + msecs_to_jiffies(1000) );
   
-  if (status != 0) {
+  if (status != 0) 
     printk(KERN_ERR "Error in timer initialization in %s, %i\n",__FUNCTION__,__LINE__);
-    return status;
-  }
   
   return status;
   
 }
 
-int deinit_char_timer( void ) {
+void deinit_char_timer( void ) {
 
   int status;
 
-  printk(KERN_INFO "my_chardevice: de-initialization of the timer\n");
+  //printk(KERN_INFO "my_chardevice: de-initialization of the timer\n");
   
   status = del_timer( &timer_cpy_buffers );
   
-  if (status != 0) {
-    printk(KERN_ERR "Could not delete the timer in %s, %i\n",__FUNCTION__,__LINE__);
-    return status;
-  }
+  if (status != 0) 
+    printk(KERN_ERR "The timer is still in use...\n");
 
-  return status;
+  return;
+
 }
 
 
@@ -197,21 +191,19 @@ int deinit_char_timer( void ) {
 
 ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
 
- 	int status;
- 	
- 	int readIndexLocal, writeIndexLocal;
+ 	int status, readIndexLocal, writeIndexLocal;
  	
  	u8 actualReader;
- 	loff_t readIndex;
-  
+ 	  
   /* Get information from actualReader*/
-	actualReader = filp->private_data;
-	mb();
-	readIndexLocal = atomic_read(&readers[actualReader].readIndex);
+	actualReader = (unsigned short int) filp->private_data;
+
+	readIndexLocal = readers[actualReader].readIndex;
+	
 	mb();
 	writeIndexLocal = atomic_read(&writeIndex);
   
-  printk(KERN_INFO "\n\DEBUG reader %i: readIndex = %d, writeIndex = %d\n",actualReader, readIndexLocal, writeIndexLocal);  
+  printk(KERN_INFO "\nDEBUG reader %i: readIndex = %d, writeIndex = %d\n",actualReader, readIndexLocal, writeIndexLocal);  
   		
   /* Validation of user pointers */
 	if (filp == NULL || buf == NULL || f_pos == NULL) {
@@ -257,8 +249,10 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
 		  return -1;
 		}
 
-		mb();
-		atomic_set(&readers[actualReader].readIndex, readIndexLocal + count);
+		//mb();
+		//atomic_set(&readers[actualReader].readIndex, readIndexLocal + count);
+  	
+  	readers[actualReader].readIndex = readIndexLocal + count;
   	
   	printk(KERN_INFO "DEBUG reader %i: copied %lu bytes from kernel to user\n",actualReader, count);
     
@@ -283,13 +277,15 @@ ssize_t dev_read(struct file *filp, char __user *buf, size_t count, loff_t *f_po
 
 ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos) {
 
+  ssize_t retvalue; 
+  
   int status, writeIndexLocal;
   u8 i;
   
   mb();
 	writeIndexLocal = atomic_read(&writeIndex);
 	
-  ssize_t retvalue=-ENOMEM;
+
 	
   //TODO: Check input parameters?
 
@@ -308,13 +304,13 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
 	}
 	
   if (count > BUFFER_SIZE - writeIndexLocal) {
-    printk(KERN_INFO "Count = %d exceeds buffer free spece = %d.  Overflow condition detected", count, (BUFFER_SIZE - writeIndexLocal) );
+    printk(KERN_INFO "Count = %lu exceeds buffer free space = %d.  Overflow condition detected", count, (BUFFER_SIZE - writeIndexLocal) );
     overflow_flag = 1;
-    count = BUFFER_SIZE - writeIndexLocal;
+    count = BUFFER_SIZE - writeIndexLocal - 1;  // with room for a final '\0'
   }
 
-	printk(KERN_INFO "\nDEBUG writer: Writting to BUFF_A: %s, chars = %lu, free space = %d\n",buf, count, BUFFER_SIZE - writeIndexLocal );
-	  
+	printk(KERN_INFO "\nDEBUG writer: Writting to BUFF_A: %s", buf );
+	printk(KERN_INFO "DEBUG writer: writeIndex = %d, chars to write = %lu, free space = %d\n", writeIndexLocal, count, BUFFER_SIZE - writeIndexLocal );  
  
   if ( writeIndexLocal >= BUFFER_SIZE ) {
     printk(KERN_INFO "Buffer is already complete");
@@ -332,9 +328,14 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
   }
  
   else {
-    printk(KERN_INFO "DEBUG writer: count = %lu writeIndex = %d\n",count, writeIndexLocal);
+    //printk(KERN_INFO "DEBUG writer: writeIndex = %d\n", writeIndexLocal);
     //writeIndexLocal += count;
   
+    if (overflow_flag == 1) {
+      *(ptr_BUFF_A + writeIndexLocal + count + 1) = '\0';
+      count++;       	
+    }
+    
     mb(); 
     atomic_set(&writeIndex, writeIndexLocal + count);
       
@@ -345,7 +346,8 @@ ssize_t dev_write(struct file *filp, const char __user *buf, size_t count, loff_
     
     retvalue = count;    
   } 
-  	
+  
+    
   return retvalue;
 }	
 
@@ -365,7 +367,7 @@ int dev_open(struct inode *inode, struct file *filp) {
 	
   	printk(KERN_INFO "my_chardevice: Opening device and allocating memory for buffers");
   	
-  	filp->private_data = MAX_READERS;  // reader are in range 0:MAX_READERS-1 so write ID es MAX_READERS
+  	filp->private_data = (void *)MAX_READERS;  // reader are in range 0:MAX_READERS-1 so write ID es MAX_READERS
   	
   	atomic_set(&writeIndex,0);
   	
@@ -402,11 +404,11 @@ int dev_open(struct inode *inode, struct file *filp) {
 		
 		readers[currentReaderId].readerID = currentReaderId;	
 		
-		filp->private_data = currentReaderId;
+		filp->private_data = (void *) currentReaderId;
 		
 		readers[currentReaderId].readerBuffer[0] = '\0';
 				
-		printk("DEBUG Reader %d: logged in\n",filp->private_data);
+		printk("DEBUG Reader %ld: logged in\n",(long) filp->private_data);
 				
   }
   
@@ -425,9 +427,9 @@ int dev_close(struct inode *inode, struct file *filp){
 
   //TODO: Check input parameters?
   
-  u8 i, usersLogged;
+  u8 i;
     
-  if (filp->private_data == MAX_READERS) {
+  if (filp->private_data == (void *)MAX_READERS) {
     
     killThemAll = 1;    // Signal to close all readers instances
     
@@ -451,8 +453,8 @@ int dev_close(struct inode *inode, struct file *filp){
    	kfree(ptr_BUFF_AUX);
    	kfree(ptr_BUFF_B);
    	
-//   	deinit_char_timer();
-   	del_timer(&timer_cpy_buffers);
+   	deinit_char_timer();
+//   	del_timer(&timer_cpy_buffers);
 
   }
   
